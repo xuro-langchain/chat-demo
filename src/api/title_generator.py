@@ -1,0 +1,170 @@
+# Title generation service using OpenAI for conversation threads
+import logging
+import os
+import re
+import string
+from typing import Optional
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+# Use Google Gemini API for title generation
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
+
+
+def build_title_prompt(user_message: str, assistant_response: Optional[str] = None) -> str:
+    """Build the prompt for title generation.
+
+    Args:
+        user_message: The user's initial message
+        assistant_response: Optional assistant response for context
+
+    Returns:
+        Formatted prompt for title generation
+    """
+    prompt = f"""Generate a very short 2-4 word title that captures the MAIN TOPIC or QUESTION.
+
+Focus on the core subject matter, not the action. Be specific and concise.
+Do NOT add any punctuation at the end (no periods, question marks, exclamation marks, etc.).
+
+User asked: {user_message[:200]}
+
+Examples:
+- "How do I use LangChain?" → "LangChain Usage"
+- "What are subgraphs in LangGraph?" → "LangGraph Subgraphs"
+- "Explain streaming in Python" → "Python Streaming"
+- "Debug authentication error" → "Auth Error"
+
+Title (2-4 words max, no quotes, no punctuation at end):"""
+
+    return prompt
+
+
+def clean_title(title: str, max_length: int = 60) -> str:
+    """Clean and format the generated title.
+
+    Args:
+        title: Raw generated title
+        max_length: Maximum length for the title
+
+    Returns:
+        Cleaned and formatted title
+    """
+    # Remove surrounding quotes if present
+    cleaned = title.replace('"', '').replace("'", '').strip()
+
+    # Remove ALL trailing punctuation (including question marks, exclamation marks, periods, etc.)
+    cleaned = cleaned.rstrip(string.punctuation)
+
+    # Capitalize first letter
+    if cleaned:
+        cleaned = cleaned[0].upper() + cleaned[1:]
+
+    # Truncate if needed
+    if len(cleaned) > max_length:
+        cleaned = cleaned[:max_length - 3] + '...'
+
+    return cleaned
+
+
+def truncate_title(message: str, max_length: int = 60) -> str:
+    """Fallback: truncate user message to use as title.
+
+    Args:
+        message: User message to truncate
+        max_length: Maximum length for the title
+
+    Returns:
+        Truncated title
+    """
+    # Clean up the message
+    title = message.strip()
+
+    # Remove common prefixes
+    title = re.sub(r'^(how do i|how to|can you|please|help me with|i need help with)\s+', '', title, flags=re.IGNORECASE)
+
+    # Remove ALL trailing punctuation
+    title = title.rstrip(string.punctuation)
+
+    # Capitalize first letter
+    if title:
+        title = title[0].upper() + title[1:]
+
+    # Truncate if needed
+    if len(title) > max_length:
+        title = title[:max_length - 3] + '...'
+
+    return title
+
+
+async def generate_title(
+    user_message: str,
+    assistant_response: Optional[str] = None,
+    max_length: int = 60
+) -> str:
+    """Generate a smart title for a conversation thread using OpenAI.
+
+    Falls back to truncated user message if API fails or is not configured.
+
+    Args:
+        user_message: The user's initial message
+        assistant_response: Optional assistant response for context
+        max_length: Maximum length for the title
+
+    Returns:
+        Generated or fallback title
+    """
+    # Fallback if no API key
+    if not GOOGLE_API_KEY:
+        logger.warning("No Google API key found, using fallback title generation")
+        return truncate_title(user_message, max_length)
+
+    try:
+        prompt = build_title_prompt(user_message, assistant_response)
+
+        # Gemini API format
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{GEMINI_API_URL}?key={GOOGLE_API_KEY}",
+                headers={
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "contents": [
+                        {
+                            "parts": [
+                                {
+                                    "text": prompt
+                                }
+                            ]
+                        }
+                    ],
+                    "generationConfig": {
+                        "temperature": 0.3,
+                        "maxOutputTokens": 50,
+                    }
+                },
+            )
+
+        if response.status_code != 200:
+            logger.error(f"Gemini API error: {response.status_code} - {response.text}")
+            return truncate_title(user_message, max_length)
+
+        data = response.json()
+        # Gemini response format: candidates[0].content.parts[0].text
+        generated_title = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+
+        if not generated_title:
+            logger.warning("No title generated by Gemini, using fallback")
+            return truncate_title(user_message, max_length)
+
+        # Clean up and return the title
+        cleaned = clean_title(generated_title, max_length)
+        logger.info(f"Generated title: {cleaned}")
+        return cleaned
+
+    except Exception as e:
+        logger.error(f"Error generating title: {e}")
+        return truncate_title(user_message, max_length)

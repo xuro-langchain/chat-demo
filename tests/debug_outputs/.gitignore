@@ -1,0 +1,2 @@
+# Ignore stream event debug outputs
+stream_events_*.json
